@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sanitas Trösch – Offerten-Tool</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=Inter:wght@400;500;600&display=swap" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #F4F1EA; font-family: 'Inter', sans-serif; color: #101F2B; }
+    input, select {
+      font-family: 'Inter', sans-serif;
+      background: #fff;
+      border: 1px solid #D8D2C2;
+      border-radius: 3px;
+      padding: 6px 8px;
+      font-size: 13px;
+      color: #101F2B;
+      width: 100%;
+    }
+    input:focus, select:focus {
+      outline: 2px solid #B98A4E;
+      outline-offset: 1px;
+      border-color: #B98A4E;
+    }
+    button { font-family: 'Inter', sans-serif; cursor: pointer; }
+    table { border-collapse: collapse; width: 100%; }
+    th { text-align: left; }
+    .btn {
+      border: none;
+      border-radius: 3px;
+      padding: 9px 16px;
+      font-weight: 600;
+      font-size: 13px;
+      letter-spacing: 0.02em;
+      transition: filter 0.15s;
+    }
+    .btn:hover { filter: brightness(1.08); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-brass { background: #B98A4E; color: #0A151E; }
+    .btn-navy  { background: #101F2B; color: #F4F1EA; }
+    .btn-ghost { background: transparent; color: #101F2B; border: 1px solid #D8D2C2; }
+    .btn-ghost:hover { background: #E9E4D8; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef } = React;
+
+    // pdf.js Worker-Pfad setzen (mit Retry falls noch nicht geladen)
+    function initPdfJs() {
+      if (window.pdfjsLib) {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+          "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js";
+        return true;
+      }
+      return false;
+    }
+    if (!initPdfJs()) {
+      window.addEventListener("load", () => {
+        setTimeout(initPdfJs, 500);
+      });
+    }
+
+    const COLORS = {
+      navy: "#101F2B", navyDeep: "#0A151E",
+      brass: "#B98A4E", brassLight: "#D4AB76",
+      off: "#F4F1EA", offDeep: "#E9E4D8",
+      line: "#D8D2C2", ok: "#3E6B4F", warn: "#A1432A",
+    };
+    const MWST = 0.081;
+
+    function uid() { return Math.random().toString(36).slice(2, 10); }
+    function chf(n) {
+      return (Number(n) || 0).toLocaleString("de-CH", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    }
+    function emptyRow() {
+      return { id: uid(), stNr: "", sgvsbNr: "", bezeichnung: "", menge: 1, preis: 0, konkurrenzPreis: "", bildUrl: "" };
+    }
+
+    /* ---- CSV ---- */
+    function parseCsv(text) {
+      const rows = []; let row = [], field = "", inQ = false;
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (inQ) {
+          if (c === '"') { if (text[i+1] === '"') { field += '"'; i++; } else inQ = false; }
+          else field += c;
+        } else {
+          if (c === '"') inQ = true;
+          else if (c === ',' || c === ';') { row.push(field); field = ""; }
+          else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ""; }
+          else if (c !== '\r') field += c;
+        }
+      }
+      if (field.length || row.length) { row.push(field); rows.push(row); }
+      return rows.filter(r => r.some(c => c.trim() !== ""));
+    }
+    function toCsv(rows, headers) {
+      const esc = v => { const s = String(v ?? ""); return /[",;\n]/.test(s) ? '"' + s.replace(/"/g,'""') + '"' : s; };
+      return [headers.join(";"), ...rows.map(r => r.map(esc).join(";"))].join("\n");
+    }
+    function downloadBlob(content, filename, type) {
+      const url = URL.createObjectURL(new Blob([content], { type }));
+      Object.assign(document.createElement("a"), { href: url, download: filename, style: "display:none" })
+        .dispatchEvent(new MouseEvent("click"));
+      URL.revokeObjectURL(url);
+    }
+
+    /* ---- Competitor text parser (Sabag/Richner) ----
+       Format: ArtNr Bezeichnung Farbe Grösse Preis Menge Betrag
+       Von rechts: Betrag Menge Preis extrahieren
+    ---- */
+    function parseCompetitorText(text) {
+      const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+      const rows = [];
+      let lastRow = null;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (/^Art\.\-?Nr\.|^Artikel|^Total|^Mwst|^Seite:|^Objekt:|^Datum:|^Projekt|^Preis CHF/i.test(line)) continue;
+        const artM = line.match(/^(\d{5,7})\s+(.+)$/);
+        if (!artM) {
+          if (lastRow && /^\d{1,4}\s/.test(line) && !/^\d{5,7}/.test(line)) {
+            lastRow.bezeichnung += " \u2013 " + line.replace(/\s+/g, " ").trim();
+          }
+          continue;
+        }
+        const sgvsbNr = artM[1];
+        const rest = artM[2].trim();
+        let konkurrenzPreis = "", menge = 1, bezeichnung = rest;
+        // Von rechts: Preis(X.XX) Menge(1-4 Stellen) Betrag(X.XX)
+        const tokens = rest.split(/\s+/);
+        const n = tokens.length;
+        if (n >= 3) {
+          const t1 = tokens[n-1], t2 = tokens[n-2], t3 = tokens[n-3];
+          const isPrice = s => /^[\d\']+\.\d{2}$/.test(s);
+          const isQty = s => /^\d{1,4}$/.test(s) && Number(s) <= 9999;
+          if (isPrice(t1) && isQty(t2) && isPrice(t3)) {
+            // t3=Preis t2=Menge t1=Betrag
+            konkurrenzPreis = t3.replace(/\'/g, "");
+            menge = Number(t2) || 1;
+            bezeichnung = tokens.slice(0, n-3).join(" ");
+          } else if (isPrice(t1) && isQty(t2)) {
+            konkurrenzPreis = t1.replace(/\'/g, "");
+            menge = Number(t2) || 1;
+            bezeichnung = tokens.slice(0, n-2).join(" ");
+          }
+        }
+        const row = { ...emptyRow(), sgvsbNr, bezeichnung, menge, konkurrenzPreis, stNr: "", preis: 0 };
+        rows.push(row);
+        lastRow = row;
+      }
+      return rows;
+    }
+
+        // Ausführungs-Zusatzzeile zur vorherigen Position anhängen
+        if (lastRow && ausfRe.test(line)) {
+          lastRow.bezeichnung += " – " + line.replace(/\s+/g, " ").trim();
+          continue;
+        }
+      }
+
+      return rows;
+    }
+
+    /* ---- Helpers ---- */
+    function applyMap(row, map) {
+      return row.sgvsbNr && map[row.sgvsbNr] ? { ...row, stNr: map[row.sgvsbNr] } : row;
+    }
+    const Th = ({ children, style }) => (
+      <th style={{ padding: "8px 6px", fontSize: 11, textTransform: "uppercase", letterSpacing: "0.03em", color: COLORS.navy, ...style }}>{children}</th>
+    );
+    const Td = ({ children }) => <td style={{ padding: "6px 6px" }}>{children}</td>;
+    function Field({ label, children }) {
+      return (
+        <label style={{ display: "block", fontSize: 11, color: "#7a7466", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.03em" }}>
+          {label}<div style={{ marginTop: 4 }}>{children}</div>
+        </label>
+      );
+    }
+    function Total({ label, value, accent }) {
+      return (
+        <div>
+          <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.03em", opacity: 0.7 }}>{label}</div>
+          <div style={{ fontFamily: "'Archivo', sans-serif", fontWeight: 800, fontSize: 22, color: accent ? COLORS.brassLight : COLORS.off, marginTop: 2 }}>{value}</div>
+        </div>
+      );
+    }
+    const secTitle = { fontFamily: "'Archivo', sans-serif", fontWeight: 700, fontSize: 15, margin: "0 0 14px", color: COLORS.navy, textTransform: "uppercase", letterSpacing: "0.04em" };
+    const card = { background: "#fff", border: `1px solid ${COLORS.line}`, borderRadius: 4, padding: 20, marginBottom: 20 };
+
+    /* ======== APP ======== */
+    function App() {
+      const [rows, setRows] = useState([emptyRow()]);
+      const [mapping, setMapping] = useState({});
+      const [mappingCount, setMappingCount] = useState(0);
+      const [mappingName, setMappingName] = useState("");
+      const [kunde, setKunde] = useState({ firma: "", ansprechpartner: "", adresse: "", offerteNr: "" });
+      const [status, setStatus] = useState("");
+      const [busy, setBusy] = useState(false);
+      const mapRef = useRef(); const pdfRef = useRef(); const csvRef = useRef();
+      const imgRefs = useRef({});
+
+      const flash = (msg, ms = 4000) => { setStatus(msg); if (ms) setTimeout(() => setStatus(s => s === msg ? "" : s), ms); };
+
+      const addRow = () => setRows(r => [...r, emptyRow()]);
+      const removeRow = id => setRows(r => r.length > 1 ? r.filter(x => x.id !== id) : r);
+      const updateRow = (id, f, v) => setRows(r => r.map(x => x.id === id ? { ...x, [f]: v } : x));
+
+      /* Mapping upload */
+      const handleMapping = async e => {
+        const file = e.target.files?.[0]; if (!file) return;
+        setBusy(true);
+        try {
+          const text = await file.text();
+          const table = parseCsv(text);
+          const header = table[0].map(h => h.trim().toLowerCase());
+          let si = header.findIndex(h => h.includes("sgvsb"));
+          let ti = header.findIndex(h => h.includes("st") || h.includes("trösch") || h.includes("troesch"));
+          let data = si !== -1 && ti !== -1 ? table.slice(1) : (si = 0, ti = 1, table);
+          const map = {}; let cnt = 0;
+          data.forEach(r => { const sg = (r[si]||"").trim(), st = (r[ti]||"").trim(); if (sg && st) { map[sg] = st; cnt++; } });
+          setMapping(map); setMappingCount(cnt); setMappingName(file.name);
+          setRows(r => r.map(x => applyMap(x, map)));
+          flash(`Mapping geladen: ${cnt} Zuordnungen aus "${file.name}".`);
+        } catch(err) { flash("Fehler Mapping: " + err.message); }
+        finally { setBusy(false); e.target.value = ""; }
+      };
+
+      /* Competitor CSV */
+      const handleCompCsv = async e => {
+        const file = e.target.files?.[0]; if (!file) return;
+        setBusy(true);
+        try {
+          const table = parseCsv(await file.text());
+          const header = table[0].map(h => h.trim().toLowerCase());
+          const idx = {
+            sg: header.findIndex(h => h.includes("sgvsb") || h.includes("artikel")),
+            bz: header.findIndex(h => h.includes("bezeichnung") || h.includes("beschreibung")),
+            mg: header.findIndex(h => h.includes("menge") || h.includes("anzahl")),
+            pr: header.findIndex(h => h.includes("preis") || h.includes("chf")),
+          };
+          const hasH = idx.sg !== -1;
+          const data = hasH ? table.slice(1) : table;
+          const imported = data.map(r => {
+            const sgvsbNr = hasH ? (r[idx.sg]||"").trim() : (r[0]||"").trim();
+            const bezeichnung = hasH ? (r[idx.bz]||"").trim() : (r[1]||"").trim();
+            if (!sgvsbNr && !bezeichnung) return null;
+            return applyMap({ ...emptyRow(), sgvsbNr, bezeichnung,
+              menge: Number(String(hasH ? r[idx.mg] : r[2] || "1").replace(",",".")) || 1,
+              konkurrenzPreis: String(hasH ? r[idx.pr] : r[3] || "").replace(/'/g,"").replace(",",".")
+            }, mapping);
+          }).filter(Boolean);
+          if (!imported.length) throw new Error("Keine Zeilen gefunden.");
+          setRows(r => { const base = r.length===1 && !r[0].sgvsbNr && !r[0].bezeichnung ? [] : r; return [...base, ...imported]; });
+          flash(`${imported.length} Positionen importiert.`);
+        } catch(err) { flash("Fehler CSV: " + err.message); }
+        finally { setBusy(false); e.target.value = ""; }
+      };
+
+      /* Competitor PDF */
+      const handleCompPdf = async e => {
+        const file = e.target.files?.[0]; if (!file) return;
+        setBusy(true);
+        try {
+          flash("PDF wird gelesen…", 0);
+          const lib = window.pdfjsLib;
+          if (!lib) throw new Error("pdf.js nicht geladen — bitte Internetverbindung prüfen.");
+          const pdf = await lib.getDocument({ data: await file.arrayBuffer() }).promise;
+          let fullText = "";
+          for (let p = 1; p <= pdf.numPages; p++) {
+            const page = await pdf.getPage(p);
+            const content = await page.getTextContent();
+            let lastY = null, buf = [], lines = [];
+            content.items.forEach(item => {
+              const y = item.transform[5];
+              if (lastY !== null && Math.abs(y - lastY) > 2) { lines.push(buf.join(" ")); buf = []; }
+              buf.push(item.str); lastY = y;
+            });
+            if (buf.length) lines.push(buf.join(" "));
+            fullText += lines.join("\n") + "\n";
+          }
+          const imported = parseCompetitorText(fullText).map(row => applyMap(row, mapping));
+          if (!imported.length) throw new Error("Keine Positionen erkannt. PDF muss Textinhalt haben (kein Scan).");
+          setRows(r => { const base = r.length===1 && !r[0].sgvsbNr && !r[0].bezeichnung ? [] : r; return [...base, ...imported]; });
+          flash(`${imported.length} Positionen aus "${file.name}" importiert.`);
+        } catch(err) { flash("Fehler PDF: " + err.message, 8000); }
+        finally { setBusy(false); e.target.value = ""; }
+      };
+
+      /* Image */
+      const handleImg = (id, e) => {
+        const file = e.target.files?.[0]; if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => updateRow(id, "bildUrl", reader.result);
+        reader.readAsDataURL(file); e.target.value = "";
+      };
+
+      /* Totals */
+      const totals = rows.reduce((acc, r) => {
+        acc.netto += (Number(r.menge)||0) * (Number(r.preis)||0);
+        if (r.konkurrenzPreis !== "") acc.konk += (Number(r.menge)||0) * (Number(r.konkurrenzPreis)||0);
+        return acc;
+      }, { netto: 0, konk: 0 });
+      const mwstB = totals.netto * MWST;
+      const total = totals.netto + mwstB;
+      const diff = totals.konk - totals.netto;
+
+      /* CSV Export */
+      const exportCsv = () => {
+        const csv = toCsv(rows.map(r => [r.stNr, r.sgvsbNr, r.bezeichnung, r.menge, chf(r.preis),
+          r.konkurrenzPreis !== "" ? chf(r.konkurrenzPreis) : "",
+          chf((Number(r.menge)||0)*(Number(r.preis)||0))]),
+          ["ST-Nr.","SGVSB-Nr.","Bezeichnung","Menge","Preis CHF","Konkurrenzpreis CHF","Summe CHF"]);
+        downloadBlob(csv, `Offerte_${kunde.offerteNr||"Entwurf"}.csv`, "text/csv;charset=utf-8");
+        flash("CSV exportiert.");
+      };
+
+      /* PDF Export */
+      const exportPdf = async () => {
+        setBusy(true);
+        try {
+          const { jsPDF } = window.jspdf;
+          const doc = new jsPDF({ unit: "mm", format: "a4" });
+          const nv = [16,31,43], br = [185,138,78], W = 210;
+          let y = 20;
+          doc.setFillColor(...nv); doc.rect(0,0,W,28,"F");
+          doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(18);
+          doc.text("Sanitas Trösch — Offerte", 14, 17);
+          doc.setDrawColor(...br); doc.setLineWidth(1); doc.line(14,22,W-14,22);
+          y = 38;
+          doc.setTextColor(20,20,20); doc.setFont("helvetica","normal"); doc.setFontSize(10);
+          if (kunde.offerteNr) { doc.text(`Offerte-Nr.: ${kunde.offerteNr}`, 14, y); y+=6; }
+          if (kunde.firma) { doc.text(`Firma: ${kunde.firma}`, 14, y); y+=6; }
+          if (kunde.ansprechpartner) { doc.text(`Ansprechpartner: ${kunde.ansprechpartner}`, 14, y); y+=6; }
+          if (kunde.adresse) { doc.text(`Adresse: ${kunde.adresse}`, 14, y); y+=6; }
+          doc.text(`Datum: ${new Date().toLocaleDateString("de-CH")}`, 14, y); y+=10;
+          const cx = { st:14, sg:44, bz:74, mg:132, pr:148, su:172 };
+          doc.setFillColor(...nv); doc.rect(14,y-5,W-28,7,"F");
+          doc.setTextColor(255,255,255); doc.setFont("helvetica","bold"); doc.setFontSize(8);
+          ["ST-Nr.","SGVSB-Nr.","Bezeichnung","Menge","Preis","Summe"].forEach((t,i) =>
+            doc.text(t, [cx.st,cx.sg,cx.bz,cx.mg,cx.pr,cx.su][i], y)); y+=7;
+          doc.setTextColor(20,20,20); doc.setFont("helvetica","normal"); doc.setFontSize(8);
+          rows.forEach((r, i) => {
+            if (y > 270) { doc.addPage(); y=20; }
+            if (i%2===0) { doc.setFillColor(244,241,234); doc.rect(14,y-4.5,W-28,6.5,"F"); }
+            const bz = doc.splitTextToSize(r.bezeichnung||"", 56);
+            doc.text(r.stNr||"-",cx.st,y); doc.text(r.sgvsbNr||"-",cx.sg,y);
+            doc.text(bz[0]||"-",cx.bz,y); doc.text(String(r.menge),cx.mg,y);
+            doc.text(chf(r.preis),cx.pr,y);
+            doc.text(chf((Number(r.menge)||0)*(Number(r.preis)||0)),cx.su,y); y+=6.5;
+            if (bz.length>1) { doc.text(bz.slice(1).join(" "),cx.bz,y); y+=5; }
+          });
+          y+=6; doc.setDrawColor(...br); doc.setLineWidth(0.5); doc.line(120,y-4,W-14,y-4);
+          doc.setFont("helvetica","normal");
+          doc.text("Netto CHF",120,y); doc.text(chf(totals.netto),172,y); y+=6;
+          doc.text(`MWST ${(MWST*100).toFixed(1)}% CHF`,120,y); doc.text(chf(mwstB),172,y); y+=6;
+          doc.setFont("helvetica","bold");
+          doc.text("Total CHF",120,y); doc.text(chf(total),172,y);
+          doc.save(`Offerte_${kunde.offerteNr||"Entwurf"}.pdf`);
+          flash("PDF exportiert.");
+        } catch(err) { flash("Fehler PDF-Export: " + err.message); }
+        finally { setBusy(false); }
+      };
+
+      return (
+        <div style={{ fontFamily: "'Inter',sans-serif", background: COLORS.off, minHeight:"100vh", color: COLORS.navy }}>
+          {/* Header */}
+          <div style={{ background: COLORS.navy, padding:"20px 28px", borderBottom:`3px solid ${COLORS.brass}` }}>
+            <div style={{ display:"flex", alignItems:"baseline", gap:12 }}>
+              <span style={{ fontFamily:"'Archivo',sans-serif", fontWeight:800, fontSize:22, color:COLORS.off }}>SANITAS TRÖSCH</span>
+              <span style={{ color:COLORS.brass, fontWeight:600, fontSize:14 }}>Offerten-Tool</span>
+            </div>
+          </div>
+
+          <div style={{ maxWidth:1180, margin:"0 auto", padding:"24px 20px 60px" }}>
+            {status && (
+              <div style={{ background:"#fff", border:`1px solid ${COLORS.brass}`, borderLeft:`4px solid ${COLORS.brass}`, padding:"10px 14px", fontSize:13, marginBottom:16, borderRadius:3 }}>
+                {status}
+              </div>
+            )}
+
+            {/* Offerte */}
+            <div style={card}>
+              <h2 style={secTitle}>Offerte</h2>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12 }}>
+                <Field label="Offerte-Nr."><input value={kunde.offerteNr} onChange={e=>setKunde({...kunde,offerteNr:e.target.value})} placeholder="z.B. 2026-0142" /></Field>
+                <Field label="Firma"><input value={kunde.firma} onChange={e=>setKunde({...kunde,firma:e.target.value})} /></Field>
+                <Field label="Ansprechpartner"><input value={kunde.ansprechpartner} onChange={e=>setKunde({...kunde,ansprechpartner:e.target.value})} /></Field>
+                <Field label="Adresse"><input value={kunde.adresse} onChange={e=>setKunde({...kunde,adresse:e.target.value})} /></Field>
+              </div>
+            </div>
+
+            {/* Mapping */}
+            <div style={card}>
+              <h2 style={secTitle}>SGVSB → ST-Nr. Mapping</h2>
+              <div style={{ display:"flex", alignItems:"center", gap:14, flexWrap:"wrap" }}>
+                <button className="btn btn-navy" onClick={()=>mapRef.current?.click()} disabled={busy}>Mapping-CSV hochladen</button>
+                <input ref={mapRef} type="file" accept=".csv,.txt" style={{display:"none"}} onChange={handleMapping} />
+                {mappingCount > 0
+                  ? <><span style={{fontSize:13, color:COLORS.ok}}>✓ {mappingCount} Zuordnungen aus "{mappingName}"</span>
+                      <button className="btn btn-ghost" onClick={()=>setRows(r=>r.map(x=>applyMap(x,mapping)))} disabled={busy}>Erneut anwenden</button></>
+                  : <span style={{fontSize:12,color:"#7a7466"}}>Format: Spalten "SGVSB-Nr." und "ST-Nr."</span>
+                }
+              </div>
+            </div>
+
+            {/* Konkurrenz Import */}
+            <div style={card}>
+              <h2 style={secTitle}>Konkurrenz-Offerte importieren</h2>
+              <div style={{ display:"flex", gap:12, flexWrap:"wrap" }}>
+                <button className="btn btn-brass" onClick={()=>pdfRef.current?.click()} disabled={busy}>Sabag / Richner PDF importieren</button>
+                <input ref={pdfRef} type="file" accept="application/pdf" style={{display:"none"}} onChange={handleCompPdf} />
+                <button className="btn btn-ghost" onClick={()=>csvRef.current?.click()} disabled={busy}>Konkurrenz-CSV importieren</button>
+                <input ref={csvRef} type="file" accept=".csv,.txt" style={{display:"none"}} onChange={handleCompCsv} />
+              </div>
+              <p style={{fontSize:12,color:"#7a7466",marginTop:10}}>"Artikel-Nr." aus Sabag/Richner = SGVSB-Nummer. Mapping wird automatisch angewendet.</p>
+            </div>
+
+            {/* Positionen */}
+            <div style={{...card, overflowX:"auto"}}>
+              <h2 style={secTitle}>Positionen</h2>
+              <table>
+                <thead>
+                  <tr style={{borderBottom:`2px solid ${COLORS.navy}`}}>
+                    <Th>Bild</Th>
+                    <Th>ST-Nr.</Th>
+                    <Th>SGVSB-Nr.</Th>
+                    <Th style={{minWidth:200}}>Bezeichnung</Th>
+                    <Th style={{width:70}}>Menge</Th>
+                    <Th style={{width:110}}>Preis CHF</Th>
+                    <Th style={{width:130}}>Konkurrenz CHF</Th>
+                    <Th style={{width:120}}>Summe CHF</Th>
+                    <Th style={{width:36}}></Th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((row, idx) => {
+                    const summe = (Number(row.menge)||0)*(Number(row.preis)||0);
+                    const konkS = row.konkurrenzPreis !== "" ? (Number(row.menge)||0)*(Number(row.konkurrenzPreis)||0) : null;
+                    const d = konkS !== null ? konkS - summe : null;
+                    return (
+                      <tr key={row.id} style={{borderBottom:`1px solid ${COLORS.line}`, background: idx%2 ? COLORS.off : "#fff"}}>
+                        <Td>
+                          <div style={{display:"flex",alignItems:"center",gap:6}}>
+                            {row.bildUrl
+                              ? <img src={row.bildUrl} alt="" style={{width:36,height:36,objectFit:"cover",borderRadius:3,border:`1px solid ${COLORS.line}`}} />
+                              : <div style={{width:36,height:36,borderRadius:3,border:`1px dashed ${COLORS.line}`,background:COLORS.off}} />
+                            }
+                            <button className="btn-ghost" style={{fontSize:11,padding:"4px 6px",border:`1px solid ${COLORS.line}`,borderRadius:3,background:"#fff"}}
+                              onClick={()=>imgRefs.current[row.id]?.click()}>⤴</button>
+                            <input ref={el=>imgRefs.current[row.id]=el} type="file" accept="image/*" style={{display:"none"}} onChange={e=>handleImg(row.id,e)} />
+                          </div>
+                        </Td>
+                        <Td><input value={row.stNr} onChange={e=>updateRow(row.id,"stNr",e.target.value)} placeholder="1111693.100" /></Td>
+                        <Td>
+                          <input value={row.sgvsbNr} placeholder="111111"
+                            onChange={e=>{
+                              const v=e.target.value;
+                              setRows(rs=>rs.map(r=>r.id!==row.id?r:{...r,sgvsbNr:v,...(mapping[v]?{stNr:mapping[v]}:{})}));
+                            }} />
+                        </Td>
+                        <Td><input value={row.bezeichnung} onChange={e=>updateRow(row.id,"bezeichnung",e.target.value)} /></Td>
+                        <Td><input type="number" min="0" value={row.menge} onChange={e=>updateRow(row.id,"menge",e.target.value)} /></Td>
+                        <Td><input type="number" min="0" step="0.05" value={row.preis} onChange={e=>updateRow(row.id,"preis",e.target.value)} /></Td>
+                        <Td><input type="number" min="0" step="0.05" value={row.konkurrenzPreis} placeholder="optional" onChange={e=>updateRow(row.id,"konkurrenzPreis",e.target.value)} /></Td>
+                        <Td>
+                          <div style={{fontSize:13}}>
+                            CHF {chf(summe)}
+                            {d !== null && <div style={{fontSize:11,color:d>=0?COLORS.ok:COLORS.warn}}>{d>=0?"−":"+"} CHF {chf(Math.abs(d))}</div>}
+                          </div>
+                        </Td>
+                        <Td>
+                          <button onClick={()=>removeRow(row.id)} style={{background:"none",border:"none",color:COLORS.warn,fontSize:18,padding:0}}>×</button>
+                        </Td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <button className="btn btn-ghost" style={{marginTop:14}} onClick={addRow}>+ Position hinzufügen</button>
+            </div>
+
+            {/* Totals */}
+            <div style={{background:COLORS.navy,color:COLORS.off,borderRadius:4,padding:20,marginBottom:20}}>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16}}>
+                <Total label="Netto" value={`CHF ${chf(totals.netto)}`} />
+                <Total label={`MWST ${(MWST*100).toFixed(1)}%`} value={`CHF ${chf(mwstB)}`} />
+                <Total label="Total" value={`CHF ${chf(total)}`} accent />
+              </div>
+              {totals.konk > 0 && (
+                <div style={{marginTop:14,paddingTop:14,borderTop:"1px solid rgba(244,241,234,0.2)",fontSize:13}}>
+                  Konkurrenzsumme: CHF {chf(totals.konk)} · Differenz:{" "}
+                  <strong style={{color:diff>=0?"#7FBF96":"#E08B6F"}}>{diff>=0?"−":"+"} CHF {chf(Math.abs(diff))}</strong>
+                </div>
+              )}
+            </div>
+
+            {/* Export */}
+            <div style={{display:"flex",gap:12}}>
+              <button className="btn btn-brass" onClick={exportPdf} disabled={busy}>Als PDF exportieren</button>
+              <button className="btn btn-navy" onClick={exportCsv} disabled={busy}>Als CSV exportieren</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
